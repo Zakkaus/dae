@@ -176,6 +176,7 @@ See `api_dev.md` section 10 for the per-issue evidence and verification.
 - Add a 20:00 UTC+8 nightly build for days with new commits, publishing only to `nightly`.
 - Include Go modules in full-source archives and use the bundled cache automatically.
 - Build the release packages with clang 22 on Ubuntu 26.04. The rpm packages now use the rpm v6 format, which rpm 4.11 (CentOS 7, Amazon Linux 2) cannot install.
+- Build the Docker image with clang 22 on Ubuntu 26.04. Building it needs BuildKit (`docker buildx`).
 
 #### Behavior changes / Upgrade notes
 
