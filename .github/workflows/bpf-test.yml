@@ -204,6 +204,99 @@ jobs:
             CLANG=clang-$VERSION STRIP=llvm-strip-$VERSION \
             ./scripts/check-trace-arch-matrix.sh
 
+  bpf_current_kernels:
+    name: BPF Kernel (${{ matrix.kernel }})
+    # The runner and LVH kernels lag behind; take the newest stable and rc
+    # builds from Ubuntu's mainline archive. An rc failure does not block.
+    runs-on: ubuntu-26.04
+    continue-on-error: ${{ matrix.kernel == 'rc' }}
+    env:
+      CGO_ENABLED: 0
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [stable, rc]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Go 1.27
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27
+
+      - name: Apply the canonical build experiments
+        run: make -s print-goexperiment-env >> "$GITHUB_ENV"
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang-22 llvm-22 qemu-system-x86 busybox-static cpio
+
+      - name: Fetch the kernel
+        env:
+          KERNEL: ${{ matrix.kernel }}
+        run: |
+          set -euo pipefail
+          base=https://kernel.ubuntu.com/mainline
+          if [ "$KERNEL" = rc ]; then pattern='v[0-9]+\.[0-9]+-rc[0-9]+'; else pattern='v[0-9]+\.[0-9]+(\.[0-9]+)?'; fi
+          # Take the newest version whose amd64 build succeeded.
+          for ver in $(curl -fsSL "$base/" | grep -oE "href=\"$pattern/\"" | sed -E 's/^href="|\/"$//g' | sort -Vr); do
+            deb=$(curl -fsSL "$base/$ver/amd64/" | grep -oE 'linux-image-unsigned-[^"]*-generic_[^"]*_amd64\.deb' | head -1 || true)
+            [ -n "$deb" ] && break
+          done
+          echo "Kernel $ver"
+          curl -fsSL -o /tmp/kernel.deb "$base/$ver/amd64/$deb"
+          dpkg-deb -x /tmp/kernel.deb /tmp/kernel
+          cp /tmp/kernel/boot/vmlinuz-* /tmp/vmlinuz
+
+      - name: Build the tests
+        run: |
+          set -euo pipefail
+          git submodule update --init
+          root=/tmp/initrd
+          mkdir -p $root/bin $root/proc $root/sys $root/dev $root/tmp
+          # `make ebpf` removes the test objects, so it runs first.
+          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED CLANG=clang-22 make ebpf
+          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED CLANG=clang-22 make ebpf-test
+          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED go test -c ./control -o $root/load.test
+          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED go test -c -tags dae_bpf_tests ./control/kern/tests/ -o $root/kernel.test
+          cp /usr/bin/busybox $root/bin/busybox
+          cat > $root/init <<'EOF'
+          #!/bin/busybox sh
+          /bin/busybox --install -s /bin
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mount -t devtmpfs devtmpfs /dev
+          mount -t bpf bpf /sys/fs/bpf
+          mount -t cgroup2 cgroup2 /sys/fs/cgroup
+          mount -t tracefs tracefs /sys/kernel/tracing
+          mount -t tmpfs tmpfs /tmp
+          ip link set lo up
+          uname -r
+          # The tests back-date state by 10 s with bpf_ktime_get_ns().
+          sleep 30
+          /load.test -test.run '^TestProductionProgramsLoad$' -test.count=1 -test.v
+          echo "load exit $?"
+          /kernel.test -test.count=1 -test.v
+          echo "kernel exit $?"
+          poweroff -f
+          EOF
+          chmod +x $root/init
+          (cd $root && sudo find . | sudo cpio -o -H newc --quiet | gzip -1 > /tmp/initrd.gz)
+
+      - name: Run the tests in a VM
+        run: |
+          set -euo pipefail
+          sudo timeout 900 qemu-system-x86_64 -enable-kvm -cpu host -m 4096 -smp 4 -nographic -no-reboot \
+            -kernel /tmp/vmlinuz -initrd /tmp/initrd.gz -append "console=ttyS0 quiet panic=-1" -net none | tee /tmp/vm.log
+          grep -q '^load exit 0' /tmp/vm.log
+          grep -q '^kernel exit 0' /tmp/vm.log
+
   bpf_abi_big_endian:
     name: BPF ABI (s390x)
     # Ubuntu 26.04 has no qemu-user-static package.
